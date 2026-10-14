@@ -145,13 +145,17 @@ def interactive():
     return sys.stdin.isatty() and sys.stderr.isatty() and not os.environ.get("PAPERCLIP_CLAUDE_TOKEN_NO_PROMPT")
 
 
-def choose(rows, what, show, default=None, flag="", ask=None):
+def choose(rows, what, show, default=None, flag="", ask=None, allow_all=False):
     """Pick one row. Interactive: numbered list, Enter keeps the default. Otherwise the default,
-    or an error with the list."""
+    or an error with the list. allow_all adds "a) all", returned as {"id": ALL}."""
     if len(rows) == 1:
         return rows[0]
+    if allow_all:
+        rows = rows + [{"id": ALL}]
     ids = [r.get("id") for r in rows]
-    listing = "\n".join("  %d) %s%s" % (i + 1, show(r), "  (default)" if r.get("id") == default else "")
+    listing = "\n".join("  %s) %s%s" % ("a" if r.get("id") == ALL else i + 1,
+                                        "all %s" % what if r.get("id") == ALL else show(r),
+                                        "  (default)" if r.get("id") == default else "")
                         for i, r in enumerate(rows))
     if ask is None:
         if not interactive():
@@ -160,20 +164,30 @@ def choose(rows, what, show, default=None, flag="", ask=None):
             raise Fail("several %s; pass %s:\n%s" % (what, flag, listing))
         ask = lambda prompt: (say(prompt), sys.stdin.readline())[1]  # noqa: E731
     for _ in range(3):
-        hint = "Enter = %d" % (ids.index(default) + 1) if default in ids else "number"
+        hint = ("Enter = %s" % ("a" if default == ALL else ids.index(default) + 1)) if default in ids else "number"
         answer = ask("Several %s:\n%s\nChoose [%s]: " % (what, listing, hint)).strip()
         if not answer and default in ids:
             return rows[ids.index(default)]
-        if answer.isdigit() and 1 <= int(answer) <= len(rows):
+        if allow_all and answer.lower() == "a":
+            return rows[-1]
+        if answer.isdigit() and 1 <= int(answer) <= len(rows) - allow_all:
             return rows[int(answer) - 1]
     raise Fail("no %s chosen" % what)
 
 
-def pick_company(pc, wanted, remembered=None):
-    """Company id from an id, a name or a name/issue-prefix prefix; else the remembered or only one."""
+ALL = "all"
+
+
+def pick_companies(pc, wanted, remembered=None):
+    """(companies, choice): one company from an id, a name or a unique name/issue prefix, or every
+    company for "all"; else the picker (default: the remembered choice) or the only one."""
     rows = pc.api("GET", "/companies")
     rows = rows.get("companies", rows) if isinstance(rows, dict) else rows
     listing = "\n".join("  %s  %s" % (r.get("id"), r.get("name")) for r in rows)
+    if not rows:
+        raise Fail("this user is in no company")
+    if (wanted or "").lower() == ALL:
+        return rows, ALL
     if wanted:
         w = wanted.lower()
         for test in (lambda r: r.get("id") == wanted,
@@ -182,18 +196,21 @@ def pick_company(pc, wanted, remembered=None):
                      or str(r.get("issuePrefix", "")).lower() == w):
             hits = [r for r in rows if test(r)]
             if len(hits) == 1:
-                return hits[0]["id"]
+                return hits, hits[0]["id"]
             if hits:
                 raise Fail("--company %r matches several companies:\n%s" % (wanted, "\n".join(
                     "  %s  %s" % (r.get("id"), r.get("name")) for r in hits)))
         raise Fail("no company matches %r:\n%s" % (wanted, listing))
-    if not rows:
-        raise Fail("this user is in no company")
-    return choose(rows, "companies", lambda r: "%s  %s" % (r.get("name"), r.get("id")), remembered,
-                  "--company <id, name or prefix>")["id"]
+    row = choose(rows, "companies", lambda r: "%s  %s" % (r.get("name"), r.get("id")), remembered,
+                 "--company <id, name, prefix or all>", allow_all=True)
+    return (rows, ALL) if row["id"] == ALL else ([row], row["id"])
 
 
 INACTIVE = ("revoked", "archived", "deleted")
+
+
+class NoConnection(Fail):
+    pass
 
 
 def discover(pc, company, connection_id=None, secret_id=None, include_inactive=False, remembered=None):
@@ -212,7 +229,7 @@ def discover(pc, company, connection_id=None, secret_id=None, include_inactive=F
                  and c.get("ownership") == "personal" and c.get("ownerUserId") in (None, me)
                  and (include_inactive or c.get("status") not in INACTIVE)]
     if not conns:
-        raise Fail("no %spersonal Anthropic subscription AI connection for this user%s" % (
+        raise NoConnection("no %spersonal Anthropic subscription AI connection for this user%s" % (
             "" if include_inactive else "active ", " with id %s" % connection_id if connection_id else
             " (revoked ones are hidden; --all shows them)"))
     conn = choose(conns, "connections", lambda c: "%s  %s  %s" % (c.get("name"), c.get("status"), c.get("id")),
@@ -230,17 +247,38 @@ def discover(pc, company, connection_id=None, secret_id=None, include_inactive=F
     return conn, hits[0]
 
 
-def resolve(args, pc):
-    """(company, connection, secret); remembers the company/connection per URL (ids only, not secret)."""
+def targets(args, pc):
+    """[(company, connection, secret, error)] for the chosen company, or every company with --company all.
+
+    In "all" mode a company without an active connection is skipped with one line, and other errors
+    are kept per company so the caller can go on. Remembers the choice per URL (ids only).
+    """
     url = args.url.rstrip("/")
     prefs = load("prefs.json")
     mine = prefs.get(url, {})
-    company = pick_company(pc, args.company, mine.get("company"))
-    conn, secret = discover(pc, company, args.connection, args.secret_id, args.all,
-                            mine.get("connection") if mine.get("company") == company else None)
-    prefs[url] = {"company": company, "connection": conn["id"]}
+    companies, choice = pick_companies(pc, args.company, mine.get("company"))
+    multi = choice == ALL
+    if multi and (args.connection or args.secret_id):
+        raise Fail("--connection and --secret-id need a single company")
+    out = []
+    for co in companies:
+        remembered = mine.get("connection") if not multi and mine.get("company") == co["id"] else None
+        try:
+            conn, secret = discover(pc, co["id"], args.connection, args.secret_id, args.all, remembered)
+            out.append((co, conn, secret, None))
+        except NoConnection as e:
+            if not multi:
+                raise
+            print("%s: skipped (%s)" % (co.get("name"), str(e).split(" (")[0]))
+        except Fail as e:
+            if not multi:
+                raise
+            out.append((co, None, None, str(e).splitlines()[0]))
+    if not out:
+        raise Fail("no company has an active personal Anthropic subscription AI connection")
+    prefs[url] = {"company": choice, "connection": None if multi else out[0][1]["id"]}
     save("prefs.json", prefs)
-    return company, conn, secret
+    return out
 
 
 # ---------------------------------------------------------------- claude setup-token in a pty, masked
@@ -344,25 +382,43 @@ def session(args):
     return Paperclip(args.url, key), lambda: None
 
 
-def do_rotate(args, pc, token):
+def check_token(token):
     token = token.strip()
     if not token.startswith("sk-ant-"):
         raise Fail("that does not look like a Claude token (expected sk-ant-…, got %d chars)" % len(token))
-    company, conn, secret = resolve(args, pc)
-    before = secret.get("latestVersion")
-    out = pc.api("POST", "/companies/%s/me/user-secrets/%s/rotate" % (company, secret["id"]), {"value": token})
-    state = load("state.json")
-    state["%s|%s" % (args.url.rstrip("/"), secret["id"])] = {
-        "rotatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "connection": conn["id"],
-        "tokenLength": len(token)}
-    save("state.json", state)
-    print("rotated secret %s (connection %s) version %s -> %s, token %d chars" % (
-        secret["id"], conn.get("name"), before, out.get("latestVersion"), len(token)))
-    if conn.get("status") != "connected":
-        print("note: connection status is %s; if runs still fail, Reconnect it in the UI and run "
-              "`renew` again (a Reconnect replaces the long-lived token, paperclipai/paperclip#15237)"
-              % conn.get("status"))
-    return OK
+    return token
+
+
+def do_rotate(args, pc, token, found):
+    """Rotate the same token into every target; go on after a failure, exit non-zero if any failed."""
+    failed = 0
+    for co, conn, secret, error in found:
+        name = co.get("name")
+        if error:
+            print("%s: FAILED %s" % (name, error))
+            failed += 1
+            continue
+        try:
+            out = pc.api("POST", "/companies/%s/me/user-secrets/%s/rotate" % (co["id"], secret["id"]),
+                         {"value": token})
+        except Fail as e:
+            print("%s: FAILED %s" % (name, e))
+            failed += 1
+            continue
+        state = load("state.json")
+        state["%s|%s" % (args.url.rstrip("/"), secret["id"])] = {
+            "rotatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "connection": conn["id"],
+            "tokenLength": len(token)}
+        save("state.json", state)
+        print("%s: rotated secret %s (connection %s) version %s -> %s, token %d chars" % (
+            name, secret["id"], conn.get("name"), secret.get("latestVersion"), out.get("latestVersion"), len(token)))
+        if conn.get("status") != "connected":
+            print("%s: note: connection status is %s; if runs still fail, Reconnect it in the UI and run "
+                  "`renew` again (a Reconnect replaces the long-lived token, paperclipai/paperclip#15237)"
+                  % (name, conn.get("status")))
+    if len(found) > 1:
+        print("%d rotated, %d failed" % (len(found) - failed, failed))
+    return ERROR if failed else OK
 
 
 def company_hint(args):
@@ -402,10 +458,10 @@ def cmd_logout(args):
 
 
 def cmd_rotate(args):
-    token = sys.stdin.read() if args.stdin else open(args.token_file).read()
+    token = check_token(sys.stdin.read() if args.stdin else open(args.token_file).read())
     pc, done = session(args)
     try:
-        return do_rotate(args, pc, token)
+        return do_rotate(args, pc, token, targets(args, pc))
     finally:
         done()
 
@@ -413,11 +469,13 @@ def cmd_rotate(args):
 def cmd_renew(args):
     pc, done = session(args)
     try:
-        resolve(args, pc)  # fail before the browser dance
+        found = targets(args, pc)  # fail before the browser dance
+        if not any(conn for _, conn, _, _ in found):
+            return do_rotate(args, pc, "", found)  # only failures: report them, no token needed
         say("Running `%s setup-token`; complete the login in your browser. The token is captured and hidden."
             % args.claude)
-        token = run_setup_token(args.claude)
-        return do_rotate(args, pc, token)
+        token = check_token(run_setup_token(args.claude))  # one token for every company
+        return do_rotate(args, pc, token, found)
     finally:
         done()
 
@@ -425,30 +483,39 @@ def cmd_renew(args):
 def cmd_check(args):
     pc, done = session(args)
     try:
-        _, conn, secret = resolve(args, pc)
+        found = targets(args, pc)
     finally:
         done()
-    code = OK
-    print("connection %s (%s): status %s%s, grant %s" % (
-        conn["id"], conn.get("name"), conn.get("status"),
-        " (%s)" % conn["unavailableReason"] if conn.get("unavailableReason") else "", conn.get("grantId")))
-    if conn.get("status") != "connected":
-        print("ATTENTION: needs re-authorization; Reconnect in the UI, then run `renew`")
-        code = ATTENTION
-    print("secret %s: version %s, status %s" % (secret["id"], secret.get("latestVersion"), secret.get("status")))
-    st = load("state.json").get("%s|%s" % (args.url.rstrip("/"), secret["id"]))
-    if not st:
-        print("token age: unknown (not rotated by this tool on this machine)")
-    else:
-        rotated = datetime.fromisoformat(st["rotatedAt"])
-        expires = rotated + timedelta(days=TOKEN_LIFETIME_DAYS)
-        left = (expires - datetime.now(timezone.utc)).days
-        print("token rotated %s; estimated expiry %s (%d days left)" % (
-            rotated.date(), expires.date(), left))
-        if left <= args.warn_days and code == OK:
-            print("EXPIRING: run `renew` soon")
-            code = EXPIRING
-    return code
+    worst = OK
+    for co, conn, secret, error in found:
+        name = co.get("name")
+        if error:
+            print("%s: FAILED %s" % (name, error))
+            worst = ERROR
+            continue
+        code = OK
+        print("%s: connection %s (%s): status %s%s, grant %s" % (
+            name, conn["id"], conn.get("name"), conn.get("status"),
+            " (%s)" % conn["unavailableReason"] if conn.get("unavailableReason") else "", conn.get("grantId")))
+        if conn.get("status") != "connected":
+            print("%s: ATTENTION: needs re-authorization; Reconnect in the UI, then run `renew`" % name)
+            code = ATTENTION
+        print("%s: secret %s: version %s, status %s" % (
+            name, secret["id"], secret.get("latestVersion"), secret.get("status")))
+        st = load("state.json").get("%s|%s" % (args.url.rstrip("/"), secret["id"]))
+        if not st:
+            print("%s: token age: unknown (not rotated by this tool on this machine)" % name)
+        else:
+            rotated = datetime.fromisoformat(st["rotatedAt"])
+            expires = rotated + timedelta(days=TOKEN_LIFETIME_DAYS)
+            left = (expires - datetime.now(timezone.utc)).days
+            print("%s: token rotated %s; estimated expiry %s (%d days left)" % (
+                name, rotated.date(), expires.date(), left))
+            if left <= args.warn_days and code == OK:
+                print("%s: EXPIRING: run `renew` soon" % name)
+                code = EXPIRING
+        worst = max(worst, code, key=[OK, EXPIRING, ATTENTION, ERROR].index)  # most urgent wins
+    return worst
 
 
 def parser():
@@ -460,7 +527,7 @@ def parser():
     common.add_argument("--no-browser", action="store_true", help="print the approval URL, do not open it")
     target = argparse.ArgumentParser(add_help=False, parents=[common])
     target.add_argument("--company", default=os.environ.get("PAPERCLIP_COMPANY_ID"),
-                        help="company id, name or name prefix (remembered per URL; auto when only one)")
+                        help="company id, name, unique prefix, or 'all' (remembered per URL; auto when only one)")
     target.add_argument("--connection", help="AI connection id (auto: your personal Anthropic subscription)")
     target.add_argument("--all", action="store_true", help="include revoked/archived connections")
     target.add_argument("--secret-id", help="user secret id override (skips discovery)")

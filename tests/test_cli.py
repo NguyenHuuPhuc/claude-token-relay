@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from paperclip_claude_token.cli import MASK, Fail, Masker, choose  # noqa: E402
+from paperclip_claude_token.cli import ALL, MASK, Fail, Masker, choose  # noqa: E402
 
 TOKEN = "sk-ant-oat01-FAKEfake_TOKEN-0123456789abcdefghijklmnopqrstuvwxyz"
 BOARD = "pcp_board_FAKEKEY123"
@@ -50,6 +50,16 @@ class Fake(BaseHTTPRequestHandler):
             return self.reply(200, {"userId": "u1"})
         if p == "/api/companies":
             return self.reply(200, s["companies"])
+        if p == "/api/companies/co2/ai-connections":
+            return self.reply(200, {"currentUserId": "u1", "connections": []})
+        if p == "/api/companies/co3/ai-connections":
+            return self.reply(500, {"error": "boom"})
+        if p == "/api/companies/co4/ai-connections":
+            return self.reply(200, {"currentUserId": "u1", "connections": [
+                {"id": "conn-4", "name": "Claude 4", "provider": "anthropic", "method": "subscription",
+                 "ownership": "personal", "ownerUserId": "u1", "grantId": "g-4", "status": "connected"}]})
+        if p == "/api/companies/co4/me/user-secrets":
+            return self.reply(200, [{"definition": {"key": "ai_g_4"}, "secret": {"id": "secret-4", "latestVersion": 1}}])
         if p == "/api/companies/co/ai-connections":
             return self.reply(200, {"currentUserId": "u1", "connections": [
                 {"id": "c-openai", "provider": "openai", "method": "subscription", "ownership": "personal",
@@ -78,6 +88,9 @@ class Fake(BaseHTTPRequestHandler):
         if p == "/api/cli-auth/revoke-current":
             s["revoked"] = True
             return self.reply(200, {"revoked": True})
+        if p == "/api/companies/co4/me/user-secrets/secret-4/rotate":
+            s["rotated4"].append(body)
+            return self.reply(200, {"id": "secret-4", "latestVersion": 2})
         if p == "/api/companies/co/me/user-secrets/secret-1/rotate":
             s["rotated"].append(body)
             s["version"] += 1
@@ -138,6 +151,17 @@ class PickerTest(unittest.TestCase):
         with self.assertRaises(Fail):
             self.pick(["x", "y", "z"])
 
+    def test_all_entry(self):
+        pick = lambda answers, default: choose(  # noqa: E731
+            self.rows, "companies", lambda r: r["name"], default, "", lambda p: answers.pop(0), allow_all=True)
+        self.assertEqual(pick(["a"], "b")["id"], ALL)
+        prompts = []
+        self.assertEqual(choose(self.rows, "companies", lambda r: r["name"], ALL, "",
+                                lambda p: prompts.append(p) or "", allow_all=True)["id"], ALL)
+        self.assertIn("a) all companies  (default)", prompts[0])
+        self.assertIn("[Enter = a]", prompts[0])
+        self.assertEqual(pick(["2"], ALL)["id"], "b")  # a number changes it
+
     def test_single_row_needs_no_prompt(self):
         self.assertEqual(choose(self.rows[:1], "companies", str, None, "", ask=lambda p: 1 / 0)["id"], "a")
 
@@ -145,7 +169,7 @@ class PickerTest(unittest.TestCase):
 class CliTest(unittest.TestCase):
     def setUp(self):
         Fake.state = {"polls": 0, "version": 4, "rotated": [], "revoked": False, "status": "connected",
-                      "companies": [{"id": "co", "name": "Agent Factory"}], "extra": []}
+                      "companies": [{"id": "co", "name": "Agent Factory"}], "extra": [], "rotated4": []}
         self.srv = HTTPServer(("127.0.0.1", 0), Fake)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.home = tempfile.mkdtemp()
@@ -249,6 +273,33 @@ class CliTest(unittest.TestCase):
         (cfg / "prefs.json").write_text(json.dumps({self.url: {"company": "not-a-guid"}}))
         self.run_cli("login")
         self.assertIsNone(Fake.state["challenge"]["requestedCompanyId"])
+
+    def test_all_companies(self):
+        Fake.state["companies"] = [{"id": "co", "name": "Agent Factory"}, {"id": "co2", "name": "Other Co"},
+                                   {"id": "co3", "name": "Broken Co"}, {"id": "co4", "name": "Fourth"}]
+        self.run_cli("login")
+        r = self.run_cli("renew", "--company", "all", "--claude", str(self.claude), stdin="CODE123\n")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)  # one company failed
+        self.assertEqual(r.stdout.count(MASK.decode()), 1)  # setup-token ran once
+        self.assertEqual(Fake.state["rotated"], [{"value": TOKEN}])  # the same token ...
+        self.assertEqual(Fake.state["rotated4"], [{"value": TOKEN}])  # ... into both companies
+        self.assertIn("Agent Factory: rotated secret secret-1 (connection My Claude subscription) version 4 -> 5", r.stdout)
+        self.assertIn("Fourth: rotated secret secret-4 (connection Claude 4) version 1 -> 2", r.stdout)
+        self.assertIn("Other Co: skipped (no active personal Anthropic subscription", r.stdout)
+        self.assertIn("Broken Co: FAILED HTTP 500", r.stdout)
+        self.assertIn("2 rotated, 1 failed", r.stdout)
+        # "all" is remembered: the next check covers every company again without flags.
+        prefs = json.loads(Path(self.home, "cfg", "prefs.json").read_text())[self.url]
+        self.assertEqual(prefs["company"], "all")
+        r = self.run_cli("check")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("Fourth: secret secret-4", r.stdout)
+        self.assertIn("Agent Factory: secret secret-1", r.stdout)
+        # Without the broken company everything passes.
+        Fake.state["companies"].pop(2)
+        self.assertEqual(self.run_cli("check").returncode, 0)
+        r = self.run_cli("rotate", "--stdin", "--company", "all", "--secret-id", "x", stdin=TOKEN)
+        self.assertIn("need a single company", r.stderr)
 
     def test_revoked_connections_ignored(self):
         def conn(i, status):

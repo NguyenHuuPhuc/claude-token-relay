@@ -57,6 +57,13 @@ paperclip-claude-token logout            # revokes the board key on the server a
 - Paperclip: `--url` (env `PAPERCLIP_URL`, default `http://localhost:3100`).
 - Company: `--company` takes an id, a name, a name prefix or an issue prefix (env
   `PAPERCLIP_COMPANY_ID`). It is picked automatically when you have only one.
+- All companies: `--company all`, or `a` in the picker. `check`, `rotate` and `renew` then cover
+  every company where you have an active Anthropic subscription connection.
+  - Companies without such a connection are skipped, with one line saying why.
+  - `renew` runs `claude setup-token` once and rotates the same token into every company.
+  - Each company gets its own result line (secret id, version before -> after). The tool carries
+    on after a failure and exits non-zero if any company failed.
+  - `all` is remembered as the default, like a single company.
 - Connection: `--connection`. By default the tool uses your one personal Anthropic subscription
   connection. Revoked and archived connections are ignored; `--all` includes them. It asks only
   when more than one candidate remains.

@@ -99,12 +99,20 @@ class Paperclip:
 
 # ---------------------------------------------------------------- board key: Paperclip's CLI-auth flow
 
-def login_flow(url, open_browser=True, poll_s=1.0):
-    """Same flow as `paperclipai auth login`: challenge → browser approval → board API key."""
+GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def login_flow(url, open_browser=True, poll_s=1.0, company_id=None):
+    """Same flow as `paperclipai auth login`: challenge → browser approval → board API key.
+
+    company_id (a GUID, e.g. the last used company) only labels the approval page with that
+    company's name; Paperclip's page has no company selector.
+    """
     pc = Paperclip(url)
     ch = pc.api("POST", "/cli-auth/challenges", {
         "command": "paperclip-claude-token login", "clientName": "paperclip-claude-token",
-        "requestedAccess": "board", "requestedCompanyId": None})
+        "requestedAccess": "board",
+        "requestedCompanyId": company_id if company_id and GUID_RE.match(company_id) else None})
     approval = ch.get("approvalUrl") or url.rstrip("/") + ch["approvalPath"]
     say("Approve access for paperclip-claude-token in your browser:\n  %s" % approval)
     if open_browser and not os.environ.get("PAPERCLIP_NO_BROWSER"):
@@ -133,6 +141,34 @@ def stored_key(url):
 
 # ---------------------------------------------------------------- discovery
 
+def interactive():
+    return sys.stdin.isatty() and sys.stderr.isatty() and not os.environ.get("PAPERCLIP_CLAUDE_TOKEN_NO_PROMPT")
+
+
+def choose(rows, what, show, default=None, flag="", ask=None):
+    """Pick one row. Interactive: numbered list, Enter keeps the default. Otherwise the default,
+    or an error with the list."""
+    if len(rows) == 1:
+        return rows[0]
+    ids = [r.get("id") for r in rows]
+    listing = "\n".join("  %d) %s%s" % (i + 1, show(r), "  (default)" if r.get("id") == default else "")
+                        for i, r in enumerate(rows))
+    if ask is None:
+        if not interactive():
+            if default in ids:
+                return rows[ids.index(default)]
+            raise Fail("several %s; pass %s:\n%s" % (what, flag, listing))
+        ask = lambda prompt: (say(prompt), sys.stdin.readline())[1]  # noqa: E731
+    for _ in range(3):
+        hint = "Enter = %d" % (ids.index(default) + 1) if default in ids else "number"
+        answer = ask("Several %s:\n%s\nChoose [%s]: " % (what, listing, hint)).strip()
+        if not answer and default in ids:
+            return rows[ids.index(default)]
+        if answer.isdigit() and 1 <= int(answer) <= len(rows):
+            return rows[int(answer) - 1]
+    raise Fail("no %s chosen" % what)
+
+
 def pick_company(pc, wanted, remembered=None):
     """Company id from an id, a name or a name/issue-prefix prefix; else the remembered or only one."""
     rows = pc.api("GET", "/companies")
@@ -151,11 +187,10 @@ def pick_company(pc, wanted, remembered=None):
                 raise Fail("--company %r matches several companies:\n%s" % (wanted, "\n".join(
                     "  %s  %s" % (r.get("id"), r.get("name")) for r in hits)))
         raise Fail("no company matches %r:\n%s" % (wanted, listing))
-    if remembered in [r.get("id") for r in rows]:
-        return remembered
-    if len(rows) == 1:
-        return rows[0]["id"]
-    raise Fail("several companies; pass --company <id, name or prefix>:\n" + listing)
+    if not rows:
+        raise Fail("this user is in no company")
+    return choose(rows, "companies", lambda r: "%s  %s" % (r.get("name"), r.get("id")), remembered,
+                  "--company <id, name or prefix>")["id"]
 
 
 INACTIVE = ("revoked", "archived", "deleted")
@@ -176,16 +211,12 @@ def discover(pc, company, connection_id=None, secret_id=None, include_inactive=F
         conns = [c for c in every if c.get("provider") == "anthropic" and c.get("method") == "subscription"
                  and c.get("ownership") == "personal" and c.get("ownerUserId") in (None, me)
                  and (include_inactive or c.get("status") not in INACTIVE)]
-        if len(conns) > 1 and remembered in [c.get("id") for c in conns]:
-            conns = [c for c in conns if c.get("id") == remembered]
     if not conns:
         raise Fail("no %spersonal Anthropic subscription AI connection for this user%s" % (
             "" if include_inactive else "active ", " with id %s" % connection_id if connection_id else
             " (revoked ones are hidden; --all shows them)"))
-    if len(conns) > 1:
-        raise Fail("several connections; pass --connection:\n" + "\n".join(
-            "  %s  %s  grant %s  %s" % (c["id"], c.get("name"), c.get("grantId"), c.get("status")) for c in conns))
-    conn = conns[0]
+    conn = choose(conns, "connections", lambda c: "%s  %s  %s" % (c.get("name"), c.get("status"), c.get("id")),
+                  remembered, "--connection <id>")
     rows = pc.api("GET", "/companies/%s/me/user-secrets" % company)
     want_key = "ai_" + str(conn.get("grantId", "")).replace("-", "_")
     hits = [r["secret"] for r in rows if r.get("secret") and (
@@ -304,7 +335,7 @@ def run_setup_token(claude="claude"):
 def session(args):
     """(Paperclip client, cleanup) using the stored key, or an ephemeral one revoked afterwards."""
     if args.ephemeral:
-        key, _ = login_flow(args.url, open_browser=not args.no_browser)
+        key, _ = login_flow(args.url, not args.no_browser, company_id=company_hint(args))
         pc = Paperclip(args.url, key)
         return pc, lambda: pc.api("POST", "/cli-auth/revoke-current", {})
     key = stored_key(args.url)
@@ -334,8 +365,16 @@ def do_rotate(args, pc, token):
     return OK
 
 
+def company_hint(args):
+    """The company to name on the approval page: --company if it is an id, else the last used one."""
+    wanted = getattr(args, "company", None)
+    if wanted and GUID_RE.match(wanted):
+        return wanted
+    return (load("prefs.json").get(args.url.rstrip("/")) or {}).get("company")
+
+
 def cmd_login(args):
-    key, user = login_flow(args.url, open_browser=not args.no_browser)
+    key, user = login_flow(args.url, not args.no_browser, company_id=company_hint(args))
     creds = load("credentials.json")
     creds[args.url.rstrip("/")] = {"token": key, "userId": user,
                                    "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}

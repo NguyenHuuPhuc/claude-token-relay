@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from paperclip_claude_token.cli import MASK, Masker  # noqa: E402
+from paperclip_claude_token.cli import MASK, Fail, Masker, choose  # noqa: E402
 
 TOKEN = "sk-ant-oat01-FAKEfake_TOKEN-0123456789abcdefghijklmnopqrstuvwxyz"
 BOARD = "pcp_board_FAKEKEY123"
@@ -113,6 +113,35 @@ class MaskerTest(unittest.TestCase):
             self.assertEqual(m.tokens, [TOKEN, "sk-ant-api03-OTHER_x"])
 
 
+class PickerTest(unittest.TestCase):
+    rows = [{"id": "a", "name": "Alpha"}, {"id": "b", "name": "Beta"}, {"id": "c", "name": "Gamma"}]
+
+    def pick(self, answers, default=None):
+        answers, prompts = list(answers), []
+
+        def ask(prompt):
+            prompts.append(prompt)
+            return answers.pop(0) + "\n"
+        row = choose(self.rows, "companies", lambda r: r["name"], default, "--company", ask)
+        return row["id"], prompts
+
+    def test_enter_keeps_default_and_marks_it(self):
+        got, prompts = self.pick([""], default="b")
+        self.assertEqual(got, "b")
+        self.assertIn("2) Beta  (default)", prompts[0])
+        self.assertIn("[Enter = 2]", prompts[0])
+
+    def test_number_and_reprompt(self):
+        self.assertEqual(self.pick(["3"], default="b")[0], "c")
+        got, prompts = self.pick(["", "9", "1"])  # no default: Enter and out-of-range ask again
+        self.assertEqual((got, len(prompts)), ("a", 3))
+        with self.assertRaises(Fail):
+            self.pick(["x", "y", "z"])
+
+    def test_single_row_needs_no_prompt(self):
+        self.assertEqual(choose(self.rows[:1], "companies", str, None, "", ask=lambda p: 1 / 0)["id"], "a")
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         Fake.state = {"polls": 0, "version": 4, "rotated": [], "revoked": False, "status": "connected",
@@ -199,7 +228,7 @@ class CliTest(unittest.TestCase):
         r = self.run_cli("check")
         self.assertEqual(r.returncode, 3)
         self.assertIn("several companies", r.stderr)
-        self.assertIn("co2  Other Co", r.stderr)
+        self.assertIn("2) Other Co  co2", r.stderr)  # no TTY: error with the list, no prompt
         r = self.run_cli("check", "--company", "nope")
         self.assertIn("no company matches", r.stderr)
         for wanted in ("co", "agent factory", "Agent", "age"):
@@ -209,6 +238,17 @@ class CliTest(unittest.TestCase):
         prefs = Path(self.home, "cfg", "prefs.json")
         self.assertEqual(json.loads(prefs.read_text())[self.url], {"company": "co", "connection": "conn-claude"})
         self.assertEqual(stat.S_IMODE(prefs.stat().st_mode), 0o600)
+
+    def test_approval_page_names_last_company(self):
+        guid = "11111111-2222-3333-4444-555555555555"
+        cfg = Path(self.home, "cfg")
+        cfg.mkdir(mode=0o700)
+        (cfg / "prefs.json").write_text(json.dumps({self.url: {"company": guid, "connection": "x"}}))
+        self.run_cli("login")
+        self.assertEqual(Fake.state["challenge"]["requestedCompanyId"], guid)
+        (cfg / "prefs.json").write_text(json.dumps({self.url: {"company": "not-a-guid"}}))
+        self.run_cli("login")
+        self.assertIsNone(Fake.state["challenge"]["requestedCompanyId"])
 
     def test_revoked_connections_ignored(self):
         def conn(i, status):

@@ -61,6 +61,12 @@ paperclip-claude-token logout            # revokes the board key on the server a
   connection. Revoked and archived connections are ignored; `--all` includes them. It asks only
   when more than one candidate remains.
 - The last company and connection used for each URL are remembered in `prefs.json` (ids only).
+  - In a terminal, when there are several companies or connections, a numbered picker appears
+    with the remembered one marked as the default; Enter keeps it.
+  - Without a TTY (cron, launchd, CI), the remembered choice is used. With no remembered choice,
+    the command exits with the list. `PAPERCLIP_CLAUDE_TOKEN_NO_PROMPT=1` forces this mode.
+  - `login` and `--ephemeral` send the last used company as `requestedCompanyId`, so Paperclip's
+    approval page shows its name. Paperclip's page has no company selector of its own.
 - `--secret-id` skips discovery. When discovery is ambiguous, the tool lists your user secrets by
   id, key and version, never by value.
 

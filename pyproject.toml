@@ -3,16 +3,17 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "paperclip-claude-token"
-version = "0.1.0"
-description = "Keep a Paperclip Claude-subscription AI connection on a long-lived `claude setup-token` token."
+name = "claude-token-relay"
+version = "0.2.0"
+description = "Put a long-lived Claude token from `claude setup-token` where it is needed (Paperclip first), never showing it."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = []
 
 [project.scripts]
-paperclip-claude-token = "paperclip_claude_token.cli:main"
+claude-token-relay = "claude_token_relay.cli:main"
+ctrelay = "claude_token_relay.cli:main"
 
 [tool.setuptools]
-packages = ["paperclip_claude_token"]
+packages = ["claude_token_relay", "claude_token_relay.targets"]

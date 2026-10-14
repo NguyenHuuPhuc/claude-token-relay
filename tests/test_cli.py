@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from paperclip_claude_token.cli import ALL, MASK, Fail, Masker, choose, set_winsize, term_rows  # noqa: E402
+from claude_token_relay.core import ALL, MASK, Fail, Masker, choose, set_winsize, term_rows  # noqa: E402
 
 TOKEN = "sk-ant-oat01-FAKEfake_TOKEN-0123456789abcdefghijklmnopqrstuvwxyz"
 BOARD = "pcp_board_FAKEKEY123"
@@ -208,10 +208,11 @@ class CliTest(unittest.TestCase):
         self.srv.shutdown()
 
     def run_cli(self, *args, stdin=""):
-        env = {**os.environ, "PAPERCLIP_CLAUDE_TOKEN_HOME": os.path.join(self.home, "cfg"),
+        env = {**os.environ, "CLAUDE_TOKEN_RELAY_HOME": os.path.join(self.home, "cfg"),
+               "PAPERCLIP_CLAUDE_TOKEN_HOME": os.path.join(self.home, "old"),
                "PAPERCLIP_URL": self.url, "PAPERCLIP_NO_BROWSER": "1"}
         env.pop("PAPERCLIP_COMPANY_ID", None)
-        r = subprocess.run([sys.executable, "-m", "paperclip_claude_token", *args], cwd=ROOT, env=env,
+        r = subprocess.run([sys.executable, "-m", "claude_token_relay", *args], cwd=ROOT, env=env,
                            input=stdin, capture_output=True, text=True, timeout=30)
         for secret in ("FAKEfake", BOARD):  # the approval URL carries the challenge secret by design
             self.assertNotIn(secret, r.stdout + r.stderr)
@@ -221,7 +222,7 @@ class CliTest(unittest.TestCase):
         r = self.run_cli("login")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(Fake.state["challenge"]["requestedAccess"], "board")
-        cred = Path(self.home, "cfg", "credentials.json")
+        cred = Path(self.home, "cfg", "paperclip.credentials.json")
         self.assertEqual(stat.S_IMODE(cred.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(cred.parent.stat().st_mode), 0o700)
 
@@ -256,7 +257,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(Fake.state["rotated"], [{"value": TOKEN}])
         self.assertTrue(Fake.state["revoked"])  # one-off key revoked afterwards
-        self.assertFalse(Path(self.home, "cfg", "credentials.json").exists())
+        self.assertFalse(Path(self.home, "cfg", "paperclip.credentials.json").exists())
 
     def test_errors_are_clear(self):
         r = self.run_cli("check")
@@ -285,7 +286,7 @@ class CliTest(unittest.TestCase):
             self.assertEqual(self.run_cli("check", "--company", wanted).returncode, 0, wanted)
         r = self.run_cli("check")  # remembered for this URL
         self.assertEqual(r.returncode, 0, r.stderr)
-        prefs = Path(self.home, "cfg", "prefs.json")
+        prefs = Path(self.home, "cfg", "paperclip.prefs.json")
         self.assertEqual(json.loads(prefs.read_text())[self.url], {"company": "co", "connection": "conn-claude"})
         self.assertEqual(stat.S_IMODE(prefs.stat().st_mode), 0o600)
 
@@ -293,10 +294,10 @@ class CliTest(unittest.TestCase):
         guid = "11111111-2222-3333-4444-555555555555"
         cfg = Path(self.home, "cfg")
         cfg.mkdir(mode=0o700)
-        (cfg / "prefs.json").write_text(json.dumps({self.url: {"company": guid, "connection": "x"}}))
+        (cfg / "paperclip.prefs.json").write_text(json.dumps({self.url: {"company": guid, "connection": "x"}}))
         self.run_cli("login")
         self.assertEqual(Fake.state["challenge"]["requestedCompanyId"], guid)
-        (cfg / "prefs.json").write_text(json.dumps({self.url: {"company": "not-a-guid"}}))
+        (cfg / "paperclip.prefs.json").write_text(json.dumps({self.url: {"company": "not-a-guid"}}))
         self.run_cli("login")
         self.assertIsNone(Fake.state["challenge"]["requestedCompanyId"])
 
@@ -315,7 +316,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("Broken Co: FAILED HTTP 500", r.stdout)
         self.assertIn("2 rotated, 1 failed", r.stdout)
         # "all" is remembered: the next check covers every company again without flags.
-        prefs = json.loads(Path(self.home, "cfg", "prefs.json").read_text())[self.url]
+        prefs = json.loads(Path(self.home, "cfg", "paperclip.prefs.json").read_text())[self.url]
         self.assertEqual(prefs["company"], "all")
         r = self.run_cli("check")
         self.assertEqual(r.returncode, 3)
@@ -326,6 +327,25 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.run_cli("check").returncode, 0)
         r = self.run_cli("rotate", "--stdin", "--company", "all", "--secret-id", "x", stdin=TOKEN)
         self.assertIn("need a single company", r.stderr)
+
+    def test_migrates_old_config_once(self):
+        Fake.state["companies"] = [{"id": "co", "name": "Agent Factory"}, {"id": "co2", "name": "Other Co"}]
+        old = Path(self.home, "old")
+        old.mkdir(mode=0o700)
+        (old / "credentials.json").write_text(json.dumps({self.url: {"token": BOARD, "userId": "u1"}}))
+        (old / "prefs.json").write_text(json.dumps({self.url: {"company": "co", "connection": "conn-claude"}}))
+        (old / "state.json").write_text(json.dumps({"%s|secret-1" % self.url: {
+            "rotatedAt": "2026-10-01T00:00:00+00:00", "tokenLength": 10}}))
+        r = self.run_cli("check", "--target", "paperclip")  # stored key, remembered company, token age survive
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("moved settings", r.stderr)
+        self.assertIn("Agent Factory: token rotated 2026-10-01", r.stdout)
+        self.assertFalse(old.exists())
+        cfg = Path(self.home, "cfg")
+        for name in ("paperclip.credentials.json", "paperclip.prefs.json", "state.json"):
+            self.assertEqual(stat.S_IMODE((cfg / name).stat().st_mode), 0o600, name)
+        self.assertIn("paperclip|%s|secret-1" % self.url, json.loads((cfg / "state.json").read_text()))
+        self.assertNotIn("moved settings", self.run_cli("check").stderr)  # only once
 
     def test_revoked_connections_ignored(self):
         def conn(i, status):
@@ -342,7 +362,7 @@ class CliTest(unittest.TestCase):
         # Two active ones: the remembered one wins; with no memory, ask, then remember the choice.
         Fake.state["extra"].append(conn(4, "connected"))
         self.assertIn("connection conn-claude", self.run_cli("check").stdout)
-        Path(self.home, "cfg", "prefs.json").unlink()
+        Path(self.home, "cfg", "paperclip.prefs.json").unlink()
         r = self.run_cli("check")
         self.assertIn("several connections", r.stderr)
         self.assertIn("old-4", r.stderr)

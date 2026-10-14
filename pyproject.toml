@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paperclip-claude-token"
+version = "0.1.0"
+description = "Keep a Paperclip Claude-subscription AI connection on a long-lived `claude setup-token` token."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+paperclip-claude-token = "paperclip_claude_token.cli:main"
+
+[tool.setuptools]
+packages = ["paperclip_claude_token"]

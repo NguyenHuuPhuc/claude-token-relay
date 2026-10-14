@@ -55,10 +55,12 @@ paperclip-claude-token logout            # revokes the board key on the server a
 - `--ephemeral` on `renew`, `rotate` or `check` approves a one-off board key, uses it, and revokes
   it again, so nothing is stored.
 - Paperclip: `--url` (env `PAPERCLIP_URL`, default `http://localhost:3100`).
-- Company: `--company` (env `PAPERCLIP_COMPANY_ID`). It is picked automatically when you have
-  only one.
+- Company: `--company` takes an id, a name, a name prefix or an issue prefix (env
+  `PAPERCLIP_COMPANY_ID`). It is picked automatically when you have only one.
 - Connection: `--connection`. By default the tool uses your one personal Anthropic subscription
-  connection.
+  connection. Revoked and archived connections are ignored; `--all` includes them. It asks only
+  when more than one candidate remains.
+- The last company and connection used for each URL are remembered in `prefs.json` (ids only).
 - `--secret-id` skips discovery. When discovery is ambiguous, the tool lists your user secrets by
   id, key and version, never by value.
 
@@ -77,7 +79,7 @@ is whatever Anthropic set for the token.
 |---|---|---|
 | Board API key | `~/.config/paperclip-claude-token/credentials.json`: directory 0700, file 0600. Override the location with `PAPERCLIP_CLAUDE_TOKEN_HOME` or `XDG_CONFIG_HOME`. | It is a full board key of your Paperclip user: Paperclip board keys have no scopes. Use `--ephemeral` if you do not want one stored. Revoke it with `logout`, or in the Paperclip UI. |
 | Claude long-lived token | Never written to disk by this tool. It goes from `claude setup-token`'s output, through memory, to Paperclip's encrypted secret store. | While `renew` runs, every `sk-ant-…` string in the terminal output is replaced with `sk-ant-***hidden***`. The tool runs the CLI in a pseudo-terminal 1000 columns wide, so the token is printed on one line and the masking sees it whole. |
-| `state.json` | Same directory, 0600 | Rotation time, connection id and token length only. |
+| `state.json`, `prefs.json` | Same directory, 0600 | Rotation time, token length, and the company and connection ids you last used. No secrets. |
 | Output | stdout and stderr | Ids, versions, statuses and lengths only. For HTTP errors, only the server's short `error` string is shown. |
 
 Anyone who can run code as your OS user can read the board key, the same as the Paperclip CLI's own

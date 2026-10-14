@@ -133,34 +133,55 @@ def stored_key(url):
 
 # ---------------------------------------------------------------- discovery
 
-def pick_company(pc, wanted):
-    if wanted:
-        return wanted
+def pick_company(pc, wanted, remembered=None):
+    """Company id from an id, a name or a name/issue-prefix prefix; else the remembered or only one."""
     rows = pc.api("GET", "/companies")
     rows = rows.get("companies", rows) if isinstance(rows, dict) else rows
+    listing = "\n".join("  %s  %s" % (r.get("id"), r.get("name")) for r in rows)
+    if wanted:
+        w = wanted.lower()
+        for test in (lambda r: r.get("id") == wanted,
+                     lambda r: str(r.get("name", "")).lower() == w,
+                     lambda r: str(r.get("name", "")).lower().startswith(w)
+                     or str(r.get("issuePrefix", "")).lower() == w):
+            hits = [r for r in rows if test(r)]
+            if len(hits) == 1:
+                return hits[0]["id"]
+            if hits:
+                raise Fail("--company %r matches several companies:\n%s" % (wanted, "\n".join(
+                    "  %s  %s" % (r.get("id"), r.get("name")) for r in hits)))
+        raise Fail("no company matches %r:\n%s" % (wanted, listing))
+    if remembered in [r.get("id") for r in rows]:
+        return remembered
     if len(rows) == 1:
         return rows[0]["id"]
-    raise Fail("several companies; pass --company:\n" + "\n".join(
-        "  %s  %s" % (r.get("id"), r.get("name")) for r in rows))
+    raise Fail("several companies; pass --company <id, name or prefix>:\n" + listing)
 
 
-def discover(pc, company, connection_id=None, secret_id=None):
+INACTIVE = ("revoked", "archived", "deleted")
+
+
+def discover(pc, company, connection_id=None, secret_id=None, include_inactive=False, remembered=None):
     """The Anthropic subscription connection and the user secret behind its grant.
 
     Paperclip keys a connection grant's credential as user secret `ai_<grantId with _>`.
+    Revoked/archived connections are ignored unless include_inactive (--all).
     """
     data = pc.api("GET", "/companies/%s/ai-connections" % company)
     me = data.get("currentUserId")
-    def mine(c):
-        if connection_id:
-            return c.get("id") == connection_id
-        return (c.get("provider") == "anthropic" and c.get("method") == "subscription"
-                and c.get("ownership") == "personal" and c.get("ownerUserId") in (None, me))
-
-    conns = [c for c in data.get("connections", []) if mine(c)]
+    every = data.get("connections", [])
+    if connection_id:
+        conns = [c for c in every if c.get("id") == connection_id]
+    else:
+        conns = [c for c in every if c.get("provider") == "anthropic" and c.get("method") == "subscription"
+                 and c.get("ownership") == "personal" and c.get("ownerUserId") in (None, me)
+                 and (include_inactive or c.get("status") not in INACTIVE)]
+        if len(conns) > 1 and remembered in [c.get("id") for c in conns]:
+            conns = [c for c in conns if c.get("id") == remembered]
     if not conns:
-        raise Fail("no personal Anthropic subscription AI connection for this user%s" %
-                   (" with id %s" % connection_id if connection_id else ""))
+        raise Fail("no %spersonal Anthropic subscription AI connection for this user%s" % (
+            "" if include_inactive else "active ", " with id %s" % connection_id if connection_id else
+            " (revoked ones are hidden; --all shows them)"))
     if len(conns) > 1:
         raise Fail("several connections; pass --connection:\n" + "\n".join(
             "  %s  %s  grant %s  %s" % (c["id"], c.get("name"), c.get("grantId"), c.get("status")) for c in conns))
@@ -170,14 +191,25 @@ def discover(pc, company, connection_id=None, secret_id=None):
     hits = [r["secret"] for r in rows if r.get("secret") and (
         r["secret"].get("id") == secret_id if secret_id else (r.get("definition") or {}).get("key") == want_key)]
     if len(hits) != 1:
-        cands = [r for r in rows if r.get("secret") and "claude" in json.dumps(r.get("definition", {})).lower()
-                 or (r.get("definition") or {}).get("key", "").startswith("ai_")]
+        cands = ["  %s  key=%s  version=%s  status=%s" % (
+            r["secret"]["id"], (r.get("definition") or {}).get("key"), r["secret"].get("latestVersion"),
+            r["secret"].get("status")) for r in rows if r.get("secret")]
         raise Fail("cannot tell which user secret holds the token (looked for %s); pass --secret-id. "
-                   "Candidates:\n%s" % (secret_id or want_key, "\n".join(
-                       "  %s  key=%s  version=%s  status=%s" % (
-                           r["secret"]["id"], r["definition"].get("key"), r["secret"].get("latestVersion"),
-                           r["secret"].get("status")) for r in cands if r.get("secret")) or "  (none)"))
+                   "Your user secrets:\n%s" % (secret_id or want_key, "\n".join(cands) or "  (none)"))
     return conn, hits[0]
+
+
+def resolve(args, pc):
+    """(company, connection, secret); remembers the company/connection per URL (ids only, not secret)."""
+    url = args.url.rstrip("/")
+    prefs = load("prefs.json")
+    mine = prefs.get(url, {})
+    company = pick_company(pc, args.company, mine.get("company"))
+    conn, secret = discover(pc, company, args.connection, args.secret_id, args.all,
+                            mine.get("connection") if mine.get("company") == company else None)
+    prefs[url] = {"company": company, "connection": conn["id"]}
+    save("prefs.json", prefs)
+    return company, conn, secret
 
 
 # ---------------------------------------------------------------- claude setup-token in a pty, masked
@@ -285,8 +317,7 @@ def do_rotate(args, pc, token):
     token = token.strip()
     if not token.startswith("sk-ant-"):
         raise Fail("that does not look like a Claude token (expected sk-ant-…, got %d chars)" % len(token))
-    company = pick_company(pc, args.company)
-    conn, secret = discover(pc, company, args.connection, args.secret_id)
+    company, conn, secret = resolve(args, pc)
     before = secret.get("latestVersion")
     out = pc.api("POST", "/companies/%s/me/user-secrets/%s/rotate" % (company, secret["id"]), {"value": token})
     state = load("state.json")
@@ -343,8 +374,7 @@ def cmd_rotate(args):
 def cmd_renew(args):
     pc, done = session(args)
     try:
-        company = pick_company(pc, args.company)
-        discover(pc, company, args.connection, args.secret_id)  # fail before the browser dance
+        resolve(args, pc)  # fail before the browser dance
         say("Running `%s setup-token`; complete the login in your browser. The token is captured and hidden."
             % args.claude)
         token = run_setup_token(args.claude)
@@ -356,8 +386,7 @@ def cmd_renew(args):
 def cmd_check(args):
     pc, done = session(args)
     try:
-        company = pick_company(pc, args.company)
-        conn, secret = discover(pc, company, args.connection, args.secret_id)
+        _, conn, secret = resolve(args, pc)
     finally:
         done()
     code = OK
@@ -392,8 +421,9 @@ def parser():
     common.add_argument("--no-browser", action="store_true", help="print the approval URL, do not open it")
     target = argparse.ArgumentParser(add_help=False, parents=[common])
     target.add_argument("--company", default=os.environ.get("PAPERCLIP_COMPANY_ID"),
-                        help="company id (auto when you have only one)")
+                        help="company id, name or name prefix (remembered per URL; auto when only one)")
     target.add_argument("--connection", help="AI connection id (auto: your personal Anthropic subscription)")
+    target.add_argument("--all", action="store_true", help="include revoked/archived connections")
     target.add_argument("--secret-id", help="user secret id override (skips discovery)")
     target.add_argument("--ephemeral", action="store_true",
                         help="approve a one-off board key for this command and revoke it afterwards")

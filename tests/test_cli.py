@@ -49,14 +49,14 @@ class Fake(BaseHTTPRequestHandler):
         if p == "/api/cli-auth/me":
             return self.reply(200, {"userId": "u1"})
         if p == "/api/companies":
-            return self.reply(200, [{"id": "co", "name": "Agent Factory"}])
+            return self.reply(200, s["companies"])
         if p == "/api/companies/co/ai-connections":
             return self.reply(200, {"currentUserId": "u1", "connections": [
                 {"id": "c-openai", "provider": "openai", "method": "subscription", "ownership": "personal",
                  "grantId": "g0", "status": "connected"},
                 {"id": "conn-claude", "name": "My Claude subscription", "provider": "anthropic",
                  "method": "subscription", "ownership": "personal", "ownerUserId": "u1", "grantId": GRANT,
-                 "status": s["status"]}]})
+                 "status": s["status"]}] + s["extra"]})
         if p == "/api/companies/co/me/user-secrets":
             return self.reply(200, [
                 {"definition": {"key": "CLAUDE_CODE_OAUTH_TOKEN"}, "secret": {"id": "stale", "latestVersion": 9}},
@@ -115,7 +115,8 @@ class MaskerTest(unittest.TestCase):
 
 class CliTest(unittest.TestCase):
     def setUp(self):
-        Fake.state = {"polls": 0, "version": 4, "rotated": [], "revoked": False, "status": "connected"}
+        Fake.state = {"polls": 0, "version": 4, "rotated": [], "revoked": False, "status": "connected",
+                      "companies": [{"id": "co", "name": "Agent Factory"}], "extra": []}
         self.srv = HTTPServer(("127.0.0.1", 0), Fake)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.home = tempfile.mkdtemp()
@@ -190,6 +191,49 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 3)
         self.assertIn("secret-1  key=ai_00000000", r.stderr)  # candidates listed, no values
         self.assertEqual(Fake.state["rotated"], [])
+
+    def test_company_by_name_and_remembered(self):
+        Fake.state["companies"] = [{"id": "co", "name": "Agent Factory", "issuePrefix": "AGE"},
+                                   {"id": "co2", "name": "Other Co", "issuePrefix": "OTH"}]
+        self.run_cli("login")
+        r = self.run_cli("check")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("several companies", r.stderr)
+        self.assertIn("co2  Other Co", r.stderr)
+        r = self.run_cli("check", "--company", "nope")
+        self.assertIn("no company matches", r.stderr)
+        for wanted in ("co", "agent factory", "Agent", "age"):
+            self.assertEqual(self.run_cli("check", "--company", wanted).returncode, 0, wanted)
+        r = self.run_cli("check")  # remembered for this URL
+        self.assertEqual(r.returncode, 0, r.stderr)
+        prefs = Path(self.home, "cfg", "prefs.json")
+        self.assertEqual(json.loads(prefs.read_text())[self.url], {"company": "co", "connection": "conn-claude"})
+        self.assertEqual(stat.S_IMODE(prefs.stat().st_mode), 0o600)
+
+    def test_revoked_connections_ignored(self):
+        def conn(i, status):
+            return {"id": "old-%d" % i, "name": "old %d" % i, "provider": "anthropic", "method": "subscription",
+                    "ownership": "personal", "ownerUserId": "u1", "grantId": "g-old-%d" % i, "status": status}
+        Fake.state["extra"] = [conn(1, "revoked"), conn(2, "revoked"), conn(3, "revoked")]
+        self.run_cli("login")
+        r = self.run_cli("check", "--all")  # nothing remembered yet: revoked ones listed
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("old-3", r.stderr)
+        r = self.run_cli("check")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("connection conn-claude", r.stdout)
+        # Two active ones: the remembered one wins; with no memory, ask, then remember the choice.
+        Fake.state["extra"].append(conn(4, "connected"))
+        self.assertIn("connection conn-claude", self.run_cli("check").stdout)
+        Path(self.home, "cfg", "prefs.json").unlink()
+        r = self.run_cli("check")
+        self.assertIn("several connections", r.stderr)
+        self.assertIn("old-4", r.stderr)
+        self.assertNotIn("old-1", r.stderr)
+        self.assertEqual(self.run_cli("check", "--connection", "conn-claude").returncode, 0)
+        r = self.run_cli("check")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("connection conn-claude", r.stdout)
 
 
 if __name__ == "__main__":

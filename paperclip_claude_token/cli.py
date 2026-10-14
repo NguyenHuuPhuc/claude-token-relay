@@ -310,27 +310,45 @@ class Masker:
         return out + buf[pos:cut]
 
 
+def term_rows(fd, default=40):
+    """Rows of the terminal on fd; default when fd is not a TTY or the ioctl fails.
+
+    struct winsize is four unsigned shorts (8 bytes): rows, cols, xpixel, ypixel.
+    """
+    import fcntl
+    import struct
+    import termios
+
+    try:
+        return struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))[0] or default
+    except (OSError, SystemError, ValueError):
+        return default
+
+
+def set_winsize(fd, rows, cols):
+    import fcntl
+    import struct
+    import termios
+
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
 def run_setup_token(claude="claude"):
     """Run `claude setup-token` interactively in a pty; return the token it printed (never shown)."""
-    import fcntl
     import pty
-    import struct
     import termios
     import tty
 
+    rows = term_rows(sys.stdin.fileno())
     pid, fd = pty.fork()
     if pid == 0:
         try:
+            # Very wide terminal, set before exec: the token is printed on one line, so the masker
+            # sees it whole.
+            set_winsize(0, rows, 1000)
             os.execvp(claude, [claude, "setup-token"])
         finally:
             os._exit(127)
-    # Very wide terminal: the token is printed on one line, so the masker sees it whole.
-    rows = 40
-    try:
-        rows = struct.unpack("hh", fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 4))[0] or 40
-    except OSError:
-        pass
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, 1000, 0, 0))
     masker, out = Masker(), sys.stdout.buffer
     stdin_tty = sys.stdin.isatty()
     old = termios.tcgetattr(sys.stdin.fileno()) if stdin_tty else None

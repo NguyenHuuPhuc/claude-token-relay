@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from paperclip_claude_token.cli import ALL, MASK, Fail, Masker, choose  # noqa: E402
+from paperclip_claude_token.cli import ALL, MASK, Fail, Masker, choose, set_winsize, term_rows  # noqa: E402
 
 TOKEN = "sk-ant-oat01-FAKEfake_TOKEN-0123456789abcdefghijklmnopqrstuvwxyz"
 BOARD = "pcp_board_FAKEKEY123"
@@ -102,6 +102,9 @@ FAKE_CLAUDE = textwrap.dedent("""\
     #!%s
     import sys, time
     assert sys.argv[1:] == ["setup-token"], sys.argv
+    import fcntl, struct, termios
+    cols = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\\0" * 8))[1]
+    assert cols == 1000, cols
     out = sys.stdout
     out.write("Open https://claude.ai/oauth/authorize?x=1 and paste the code: "); out.flush()
     code = sys.stdin.readline().strip()
@@ -124,6 +127,29 @@ class MaskerTest(unittest.TestCase):
             self.assertNotIn(b"OTHER", out)
             self.assertEqual(out, b"before " + MASK + b" middle " + MASK + b" after sk-a")
             self.assertEqual(m.tokens, [TOKEN, "sk-ant-api03-OTHER_x"])
+
+
+class TerminalTest(unittest.TestCase):
+    def test_winsize_roundtrip_on_a_real_pty(self):
+        import pty
+        master, slave = pty.openpty()
+        try:
+            set_winsize(slave, 37, 1000)
+            self.assertEqual(term_rows(slave), 37)
+            self.assertEqual(term_rows(master), 37)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_not_a_tty_falls_back(self):
+        r, w = os.pipe()
+        try:
+            self.assertEqual(term_rows(r), 40)
+            self.assertEqual(term_rows(r, default=24), 24)
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertEqual(term_rows(9999), 40)  # bad fd
 
 
 class PickerTest(unittest.TestCase):
